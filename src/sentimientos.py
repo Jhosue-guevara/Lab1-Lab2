@@ -1,3 +1,22 @@
+"""
+Analisis de Sentimientos y Scraping.
+
+Lee opiniones de un sitio web (un foro, una pagina de noticias o una URL que ingrese
+el usuario), las muestra y clasifica el sentimiento de cada una como positivo, neutro
+o negativo usando un modelo de lenguaje en espanol.
+
+La seccion tiene dos pestanas:
+
+    1. Analizar texto propio  -> el usuario escribe un texto y se evalua su sentimiento.
+    2. Scraping y analisis masivo -> se extraen opiniones de una pagina web y se
+       analizan todas, mostrando metricas, graficos y una conclusion.
+
+Herramientas: `requests` + `BeautifulSoup` para el scraping y la libreria
+`sentiment-analysis-spanish` para el modelo de sentimiento.
+
+El punto de entrada es `run()`, invocado desde `Inicio.py`.
+"""
+
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
@@ -116,11 +135,19 @@ div[data-testid="stMetric"] {
 # ─── Carga del modelo (cache para no recargar) ────────────────────────────────
 @st.cache_resource
 def cargar_modelo():
+    """Carga el modelo de sentimiento en espanol.
+
+    El decorador `@st.cache_resource` mantiene el modelo en memoria entre
+    interacciones para no volver a cargarlo (es costoso) en cada analisis.
+    El modelo devuelve una probabilidad entre 0 (negativo) y 1 (positivo).
+    """
     from sentiment_analysis_spanish import sentiment_analysis
     return sentiment_analysis.SentimentAnalysisSpanish()
 
 
 # ─── Fuentes de scraping ──────────────────────────────────────────────────────
+# Cada fuente predefinida indica la URL a leer y el selector CSS de los textos.
+# Las entradas con valor None ("demo" y "URL propia") reciben un trato especial.
 SOURCES = {
     "Opiniones de demo (offline)": None,
     "Reddit r/Spain (foro)": {
@@ -135,6 +162,15 @@ SOURCES = {
         "url": "https://cnnespanol.cnn.com/",
         "selector": "span.container__headline-text",
     },
+    "Reddit r/espanol (foro)": {
+        "url": "https://old.reddit.com/r/espanol/",
+        "selector": "p.title a.title",
+    },
+    "Meneame (noticias y opiniones)": {
+        "url": "https://www.meneame.net/",
+        "selector": "a.ttl",
+    },
+    "Pegar mi propia URL": None,
 }
 
 DEMO_OPINIONS = [
@@ -159,25 +195,79 @@ DEMO_OPINIONS = [
 ]
 
 
-def _scrape(source_key: str):
+def _extraer_textos(soup, selector=None):
+    """Extrae textos de la pagina, evitando vacios y duplicados.
+
+    Primero intenta con el selector especifico de la fuente. Si ese selector
+    encuentra muy poco (la pagina pudo cambiar), recurre a una extraccion generica
+    sobre los titulares y parrafos comunes. Asi se evitan los 'huecos' cuando el
+    selector original deja de funcionar.
+    """
+    textos = []
+    if selector:
+        textos = [e.get_text(strip=True) for e in soup.select(selector)]
+
+    # Respaldo generico si el selector especifico no trajo suficientes resultados.
+    if len([t for t in textos if len(t) > 20]) < 3:
+        for tag in ["h2", "h3", "li", "p", "blockquote"]:
+            textos += [e.get_text(strip=True) for e in soup.find_all(tag)]
+
+    # Limpieza: se decodifican entidades HTML, se filtran textos cortos y se
+    # eliminan duplicados conservando el orden de aparicion.
+    vistos, limpios = set(), []
+    for t in textos:
+        t = html.unescape(t).strip()
+        if len(t) >= 25 and t not in vistos:
+            vistos.add(t)
+            limpios.append(t)
+    return limpios[:30]
+
+
+def _scrape(source_key: str, url_personalizada: str = ""):
+    """Descarga la pagina elegida y devuelve (opiniones, error, url_usada)."""
+    # Modo demo: opiniones de ejemplo sin necesidad de internet.
     if source_key == "Opiniones de demo (offline)":
-        return DEMO_OPINIONS, None
-    cfg = SOURCES[source_key]
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        return DEMO_OPINIONS, None, "Opiniones de demostracion (sin conexion)"
+
+    # Se determina la URL y el selector segun sea una fuente predefinida o propia.
+    if source_key == "Pegar mi propia URL":
+        url, selector = url_personalizada.strip(), None
+        if not url:
+            return [], "No se ingreso ninguna URL.", ""
+        if not url.startswith("http"):
+            url = "https://" + url
+    else:
+        cfg = SOURCES[source_key]
+        url, selector = cfg["url"], cfg["selector"]
+
+    # Cabeceras que imitan un navegador real para reducir bloqueos. Aun asi, algunos
+    # sitios (investing.com, Amazon, etc.) tienen proteccion anti-bots y devolveran 403.
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+        "Referer": "https://www.google.com/",
+    }
     try:
-        resp = requests.get(cfg["url"], headers=headers, timeout=10)
+        resp = requests.get(url, headers=headers, timeout=10)
         resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        elements = soup.select(cfg["selector"])
-        texts = [html.unescape(e.get_text(strip=True)) for e in elements if e.get_text(strip=True)]
-        texts = [t for t in texts if len(t) > 20][:25]
-        return texts, None
+        # Se pasa resp.content (bytes) para que BeautifulSoup detecte la codificacion
+        # real de la pagina; con resp.text los acentos del espanol salian mal (Est�s).
+        soup = BeautifulSoup(resp.content, "html.parser")
+        return _extraer_textos(soup, selector), None, url
     except Exception as e:
-        return [], str(e)
+        return [], str(e), url
 
 
 def _classify(score: float):
-    """Clasifica el score del modelo (0=negativo, 1=positivo)."""
+    """Traduce el puntaje numerico del modelo a una etiqueta y un porcentaje de confianza.
+
+    El modelo entrega un valor entre 0 y 1:
+      - > 0.6  -> Positivo (la confianza es el propio puntaje).
+      - < 0.4  -> Negativo (la confianza es 1 menos el puntaje).
+      - entre 0.4 y 0.6 -> Neutro o mixto.
+    """
     if score > 0.6:
         return "Positivo", score * 100
     elif score < 0.4:
@@ -187,18 +277,21 @@ def _classify(score: float):
 
 
 def run():
+    """Punto de entrada: dibuja el encabezado y las dos pestanas de la seccion."""
     st.markdown(CARD_CSS, unsafe_allow_html=True)
     st.markdown('<div class="section-title">Analisis de Sentimientos y Scraping</div>', unsafe_allow_html=True)
     st.markdown('<div class="sub-label">Extrae opiniones y clasifica su sentimiento con un modelo de lenguaje en espanol</div>',
                 unsafe_allow_html=True)
 
-    # ── Pestanas ──────────────────────────────────────────────────────────────
+    # ── Pestanas: analisis de un texto escrito por el usuario, o de muchas
+    #    opiniones extraidas de una pagina web. ─────────────────────────────────
     tab_texto, tab_scraping = st.tabs(["Analizar texto propio", "Scraping y analisis masivo"])
 
     # ═══════════════════════════════════════════════════════════════════════════
     # TAB 1: TEXTO PROPIO
     # ═══════════════════════════════════════════════════════════════════════════
     with tab_texto:
+        # Pestana 1: el usuario escribe un texto y el modelo evalua su sentimiento.
         st.subheader("Analisis de texto individual")
         st.write("Escribe un comentario para evaluar si su tono es positivo o negativo de forma local.")
 
@@ -270,33 +363,55 @@ def run():
     # TAB 2: SCRAPING MASIVO
     # ═══════════════════════════════════════════════════════════════════════════
     with tab_scraping:
+        # Pestana 2: se extraen muchas opiniones de una pagina web y se analizan todas.
         st.subheader("Extraccion y analisis masivo de opiniones")
 
-        col_src, col_btn = st.columns([3, 1])
-        with col_src:
-            source = st.selectbox("Fuente de opiniones", list(SOURCES.keys()))
-        with col_btn:
-            st.markdown("<br>", unsafe_allow_html=True)
-            run_btn = st.button("Extraer y Analizar", type="primary", key="btn_scraping")
+        source = st.selectbox("Fuente de opiniones", list(SOURCES.keys()))
+
+        # Campo para que el usuario pegue su propia URL (solo si elige esa opcion).
+        url_personalizada = ""
+        if source == "Pegar mi propia URL":
+            url_personalizada = st.text_input(
+                "Pega la direccion (URL) de la pagina con opiniones:",
+                placeholder="https://www.ejemplo.com/articulo-con-comentarios",
+            )
+
+        # Se muestra de antemano de donde se va a leer, para que sea transparente.
+        if source not in ("Opiniones de demo (offline)", "Pegar mi propia URL"):
+            st.caption(f"Se leera de: {SOURCES[source]['url']}")
+
+        run_btn = st.button("Extraer y Analizar", type="primary", key="btn_scraping")
 
         if run_btn:
             with st.spinner("Extrayendo opiniones..."):
-                texts, error = _scrape(source)
+                texts, error, url_usada = _scrape(source, url_personalizada)
 
+            # Si hubo error, se avisa con un mensaje claro. El 403 significa que el
+            # sitio bloqueo el acceso automatico; en ese caso se usan las opiniones demo.
             if error:
-                st.warning(f"No se pudo conectar al sitio: {error}. Se usaran las opiniones de demo.")
-                texts = DEMO_OPINIONS
+                if "403" in error:
+                    st.warning("El sitio bloqueo el acceso automatico (error 403). Muchas "
+                               "paginas comerciales no permiten scraping. Mostrando "
+                               "opiniones de demostracion como ejemplo.")
+                else:
+                    st.warning(f"No se pudo leer la pagina ({error}). Mostrando opiniones "
+                               "de demostracion como ejemplo.")
+                texts, url_usada = DEMO_OPINIONS, "Opiniones de demostracion (el sitio no permitio el acceso)"
 
             if not texts:
-                st.error("No se encontraron opiniones. Intente con otra fuente.")
+                st.error("No se encontraron opiniones en esa pagina. Pruebe con otra fuente o URL.")
                 return
 
+            # Se informa claramente cuantas opiniones se leyeron y de donde (fuente real).
+            st.info(f"Se leyeron **{len(texts)}** opiniones de: {url_usada}")
+
+            # Se analiza cada opinion con el modelo y se guarda su etiqueta y puntaje.
             with st.spinner(f"Analizando {len(texts)} opiniones con el modelo en espanol..."):
                 nlp = cargar_modelo()
                 results = []
                 for t in texts:
-                    score = nlp.sentiment(t)
-                    sentimiento, confianza = _classify(score)
+                    score = nlp.sentiment(t)                       # probabilidad 0-1
+                    sentimiento, confianza = _classify(score)      # etiqueta + confianza
                     results.append({
                         "Opinion": t,
                         "Sentimiento": sentimiento,
@@ -304,12 +419,12 @@ def run():
                         "Confianza (%)": round(confianza, 1),
                     })
 
-            df = pd.DataFrame(results)
+            df = pd.DataFrame(results)   # tabla con todas las opiniones analizadas
 
-            st.success(f"Se analizaron **{len(df)}** opiniones de '{source}'.")
+            st.success(f"Se analizaron **{len(df)}** opiniones de: {url_usada}")
             st.markdown("---")
 
-            # Metricas globales
+            # Metricas globales: cuantas opiniones de cada sentimiento.
             counts = df["Sentimiento"].value_counts()
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Total de opiniones", len(df))
@@ -354,11 +469,12 @@ def run():
                 )
                 st.plotly_chart(fig_hist, use_container_width=True)
 
-            # Tabla de resultados
+            # Lista de opiniones: cada una en una tarjeta con su etiqueta de color.
             st.markdown("---")
             st.subheader("Opiniones analizadas")
 
             for _, row in df.iterrows():
+                # Se elige el color de la etiqueta segun el sentimiento.
                 s = row["Sentimiento"]
                 if s == "Positivo":
                     badge = f'<span class="badge-pos">Positivo</span>'
@@ -367,6 +483,7 @@ def run():
                 else:
                     badge = f'<span class="badge-neu">Neutro</span>'
 
+                # html.escape evita que el texto de la opinion rompa el HTML de la tarjeta.
                 st.markdown(f"""
                 <div class="opinion-card">
                     {badge}
@@ -377,16 +494,17 @@ def run():
                 </div>
                 """, unsafe_allow_html=True)
 
-            # Conclusion
-            dominant = df["Sentimiento"].mode()[0]
-            pct = counts.get(dominant, 0) / len(df) * 100
-            avg_score = df["Puntaje"].mean()
+            # Conclusion automatica del analisis del conjunto de opiniones.
+            dominant = df["Sentimiento"].mode()[0]          # sentimiento mas frecuente
+            pct = counts.get(dominant, 0) / len(df) * 100   # su porcentaje sobre el total
+            avg_score = df["Puntaje"].mean()                # puntaje promedio del modelo
+            # Tono general segun el puntaje promedio.
             tono = "favorable" if avg_score > 0.6 else "desfavorable" if avg_score < 0.4 else "neutral"
 
             st.markdown(f"""
             <div class="conc-box">
                 <strong>Conclusion del analisis:</strong><br>
-                De las <strong>{len(df)}</strong> opiniones analizadas de <em>{source}</em>,
+                De las <strong>{len(df)}</strong> opiniones analizadas de <em>{url_usada}</em>,
                 el sentimiento predominante es <strong>{dominant}</strong>
                 ({pct:.1f}% de las opiniones).
                 El puntaje promedio del modelo es <strong>{avg_score:.4f}</strong>,
