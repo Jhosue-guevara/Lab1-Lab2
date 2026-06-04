@@ -1,230 +1,311 @@
+"""
+Prompts de IA (consulta de datos en lenguaje natural).
+
+Ofrece una interfaz tipo chat donde el usuario escribe preguntas en espanol sobre
+un conjunto de datos y recibe la respuesta calculada sobre el. Puede usar uno de
+los datasets del proyecto o subir su propio archivo CSV/Excel.
+
+Ejemplos de preguntas que entiende:
+    - Cuantas columnas tiene el dataset?
+    - Cual es la media del campo metacritic_score?
+    - Cual es el mayor valor del campo year?
+    - Tambien saluda ("hola") y explica que puede hacer ("ayuda").
+
+El "motor de IA" es un interprete de reglas: identifica la intencion de la pregunta
+y el campo mencionado, y ejecuta la operacion correspondiente con pandas. No es un
+modelo de lenguaje entrenado, pero responde en lenguaje natural.
+
+El punto de entrada es `run()`, invocado desde `Inicio.py`.
+"""
+
+import re
 import streamlit as st
 import pandas as pd
 import numpy as np
-import re
 
+# Estilo sobrio coherente con el resto del proyecto (acento azul #1e40af).
 LIGHT_CSS = """
 <style>
-.stApp { background-color: #ffffff !important; color: #1a1d2e !important; }
-section[data-testid="stSidebar"] { background-color: #f8f9fb !important; }
-.section-title { font-size: 1.5rem; font-weight: 800; color: #2d3a8c; margin-bottom: 4px; }
-.sub-label { color: #64748b; font-size: 0.88rem; margin-bottom: 20px; }
-.chat-bubble-user {
-    background: #eef2ff;
-    border: 1px solid #c7d2fe;
-    border-radius: 12px 12px 2px 12px;
-    padding: 12px 16px;
-    margin: 8px 0 8px 60px;
-    color: #1a1d2e;
-    font-size: 0.92rem;
-}
-.chat-bubble-ai {
-    background: #f8f9fb;
-    border: 1px solid #e0e3ed;
-    border-radius: 12px 12px 12px 2px;
-    padding: 12px 16px;
-    margin: 8px 60px 8px 0;
-    color: #1a1d2e;
-    font-size: 0.92rem;
-}
-.chat-label-user { text-align: right; color: #4338ca; font-size: 0.75rem; font-weight: 700; }
-.chat-label-ai   { color: #374151; font-size: 0.75rem; font-weight: 700; }
+.stApp { background-color: #ffffff !important; color: #0f172a !important; }
+section[data-testid="stSidebar"] { background-color: #f8fafc !important; }
+.section-title { font-size: 1.6rem; font-weight: 700; color: #0f172a; margin-bottom: 2px; }
+.section-title::after { content:""; display:block; width:42px; height:3px;
+    background:#1e40af; border-radius:2px; margin-top:8px; }
+.sub-label { color: #64748b; font-size: 0.9rem; margin: 10px 0 18px; }
 div[data-testid="stMetric"] {
-    background: #f8f9fb !important;
-    border: 1px solid #e0e3ed !important;
-    border-radius: 10px !important;
-    padding: 12px 16px !important;
+    background: #f8fafc !important; border: 1px solid #e2e8f0 !important;
+    border-radius: 10px !important; padding: 12px 16px !important;
 }
 </style>
 """
 
+
 @st.cache_data
-def load_imdb():
-    return pd.read_csv("data/imdb_top_movies_1980_2026.csv")
+def load_games():
+    """Carga (cacheada) el dataset de videojuegos."""
+    return pd.read_csv("data/games.csv")
+
 
 @st.cache_data
 def load_fraud():
+    """Carga (cacheada) el dataset de deteccion de fraude."""
     return pd.read_csv("data/retail_fraud_detection_100k.csv")
 
+
+# Datasets del proyecto disponibles para consultar.
 DATASETS = {
-    "IMDB Top Movies 1980-2026": load_imdb,
-    "Retail Fraud Detection 100K": load_fraud,
+    "Videojuegos (games.csv)": load_games,
+    "Fraude (retail_fraud_detection)": load_fraud,
 }
 
+# Preguntas de ejemplo que se muestran como botones.
+SUGGESTIONS = [
+    "Cuantas filas tiene el dataset?",
+    "Cuantas columnas tiene?",
+    "Cuales son los nombres de las columnas?",
+    "Cual es la media del campo metacritic_score?",
+    "Cual es el maximo del campo year?",
+    "Cual es el valor mas frecuente del campo genre?",
+]
 
-def _answer(question: str, df: pd.DataFrame) -> str:
-    q = question.lower().strip()
-    q = re.sub(r"[?!]", "", q).strip()
 
-    if re.search(r"cu[aá]ntas?\s+filas|cu[aá]ntos?\s+registros|cu[aá]ntos?\s+datos|tama[nñ]o|rows", q):
+# ──────────────────────────────────────────────────────────────────────────────
+# MOTOR DE RESPUESTAS
+# ──────────────────────────────────────────────────────────────────────────────
+def _col_en_pregunta(df, q):
+    """Busca cual columna del dataset menciona la pregunta.
+
+    Compara el texto con el nombre de cada columna (con espacios o guiones bajos) y,
+    si no hay coincidencia directa, con las palabras que componen el nombre.
+    Devuelve el nombre real de la columna, o None si no reconoce ninguna.
+    """
+    q_norm = q.lower()
+    mejor, mejor_largo = None, 0
+    # Coincidencia con el nombre completo de la columna (mas fiable).
+    for c in df.columns:
+        for variante in {c.lower(), c.lower().replace("_", " ")}:
+            if variante in q_norm and len(variante) > mejor_largo:
+                mejor, mejor_largo = c, len(variante)
+    if mejor:
+        return mejor
+    # Respaldo: coincidencia por alguna palabra del nombre (ej. "amount" en "transaction_amount").
+    for c in df.columns:
+        palabras = [w for w in re.split(r"[_\s]+", c.lower()) if len(w) > 2]
+        if any(re.search(r"\b" + re.escape(w) + r"\b", q_norm) for w in palabras):
+            return c
+    return None
+
+
+def _fmt(v):
+    """Formatea un numero: sin decimales si es entero, con 4 decimales si no."""
+    try:
+        return f"{int(v):,}" if float(v) == int(v) else f"{v:,.4f}"
+    except (ValueError, TypeError, OverflowError):
+        return str(v)
+
+
+def _answer(question, df):
+    """Interpreta la pregunta y devuelve la respuesta en texto (Markdown).
+
+    Detecta primero saludos y mensajes sociales; luego intenciones de consulta de
+    datos (filas, columnas, media, maximo, etc.) y, para las que se refieren a un
+    campo, identifica la columna mencionada con `_col_en_pregunta`.
+    """
+    q = re.sub(r"[?!¿¡]", "", question.lower()).strip()
+
+    # ── Mensajes sociales ──────────────────────────────────────────────────────
+    if re.search(r"\b(hola|buenas|buenos dias|buenas tardes|buenas noches|hey|saludos|que tal)\b", q):
+        return ("Hola. Soy tu asistente de datos. Puedo responder preguntas sobre el "
+                "dataset cargado. Por ejemplo: *cuantas columnas tiene?* o *cual es la "
+                "media del campo metacritic_score?*. Escribe *ayuda* para ver todo lo que puedo hacer.")
+    if re.search(r"\b(gracias|muchas gracias|genial|perfecto)\b", q):
+        return "Con gusto. Si tienes otra pregunta sobre los datos, aqui estoy."
+    if re.search(r"\b(adios|chao|hasta luego|nos vemos|bye)\b", q):
+        return "Hasta luego. Vuelve cuando quieras consultar mas datos."
+    # Preguntas sobre como usar la aplicacion (subir archivos / cambiar de dataset).
+    if re.search(r"(subir|cargar|importar|usar)\s+(un\s+)?(csv|archivo|excel|fichero|datos)|"
+                 r"puedo\s+subir|c[oó]mo\s+subo|mi\s+propio\s+archivo", q):
+        return ("Si. En la parte de arriba, en **Fuente de datos**, elige "
+                "**Subir mi archivo (CSV/Excel)** y selecciona tu archivo. Despues "
+                "podras hacerme preguntas sobre el (cuantas columnas tiene, la media de "
+                "un campo, etc.).")
+    if re.search(r"(qu[eé]|cu[aá]les)\s+(datasets?|datos|fuentes?).*(hay|tienes|disponibles)|"
+                 r"cambiar\s+(de\s+)?dataset|otro\s+dataset", q):
+        return ("Arriba puedes elegir la **Fuente de datos**: Videojuegos, Fraude, o "
+                "subir tu propio archivo CSV/Excel.")
+    if re.search(r"(ayuda|que puedes hacer|que sabes hacer|opciones|help|como funciona)", q):
+        return (
+            "Puedo responder preguntas como:\n\n"
+            "- *Cuantas filas / columnas tiene el dataset?*\n"
+            "- *Cuales son los nombres de las columnas?*\n"
+            "- *Cual es la media / mediana / maximo / minimo / suma del campo [nombre]?*\n"
+            "- *Cual es la desviacion estandar del campo [nombre]?*\n"
+            "- *Cual es el valor mas frecuente del campo [nombre]?*\n"
+            "- *Cuantos valores unicos tiene el campo [nombre]?*\n"
+            "- *Cuantos nulos tiene el campo [nombre]?* / *Cuantos nulos hay en total?*\n"
+            "- *Cuales son los tipos de datos?* / *Muestrame el resumen estadistico*"
+        )
+
+    # ── Consultas sobre el dataset completo ────────────────────────────────────
+    if re.search(r"cu[aá]ntas?\s+filas|cu[aá]ntos?\s+registros|cu[aá]ntos?\s+datos|n[uú]mero\s+de\s+filas|rows", q):
         return f"El dataset tiene **{len(df):,} filas** (registros)."
 
-    if re.search(r"cu[aá]ntas?\s+columnas|cu[aá]ntos?\s+campos|columns", q):
-        return f"El dataset tiene **{df.shape[1]} columnas**:\n\n" + "\n".join(f"- `{c}`" for c in df.columns)
+    if re.search(r"cu[aá]ntas?\s+columnas|cu[aá]ntos?\s+campos|n[uú]mero\s+de\s+columnas|columns", q):
+        return (f"El dataset tiene **{df.shape[1]} columnas**:\n\n"
+                + "\n".join(f"- `{c}`" for c in df.columns))
 
-    if re.search(r"nombres?\s+de\s+(las\s+)?columnas|qu[eé]\s+columnas|cuales\s+son\s+los\s+campos|list.*column", q):
+    if re.search(r"nombres?\s+de\s+(las\s+)?columnas|qu[eé]\s+columnas|cu[aá]les\s+son\s+los\s+campos|lista.*column", q):
         return "Las columnas del dataset son:\n\n" + "\n".join(f"- `{c}`" for c in df.columns)
 
-    mean_match = re.search(r"(media|promedio|mean|average)\s+(del?\s+campo\s+)?([a-z_\s]+)", q)
-    if mean_match:
-        hint = mean_match.group(3).strip().replace(" ", "_")
-        col  = _find_col(df, hint)
-        if col and pd.api.types.is_numeric_dtype(df[col]):
-            return f"La **media** del campo `{col}` es **{df[col].mean():,.4f}**."
-        elif col:
-            return f"El campo `{col}` es categorico, no se puede calcular la media."
-        return f"No encontre un campo relacionado con '{hint}'."
-
-    max_match = re.search(r"(m[aá]ximo|mayor\s+valor|max)\s+(del?\s+campo\s+)?([a-z_\s]+)", q)
-    if max_match:
-        hint = max_match.group(3).strip().replace(" ", "_")
-        col  = _find_col(df, hint)
-        if col and pd.api.types.is_numeric_dtype(df[col]):
-            return f"El **valor maximo** del campo `{col}` es **{df[col].max():,.4f}**."
-        elif col:
-            return f"El **valor maximo** del campo `{col}` es **'{df[col].dropna().astype(str).max()}'**."
-        return f"No encontre un campo relacionado con '{hint}'."
-
-    min_match = re.search(r"(m[ií]nimo|menor\s+valor|min)\s+(del?\s+campo\s+)?([a-z_\s]+)", q)
-    if min_match:
-        hint = min_match.group(3).strip().replace(" ", "_")
-        col  = _find_col(df, hint)
-        if col and pd.api.types.is_numeric_dtype(df[col]):
-            return f"El **valor minimo** del campo `{col}` es **{df[col].min():,.4f}**."
-        elif col:
-            return f"El **valor minimo** del campo `{col}` es **'{df[col].dropna().astype(str).min()}'**."
-        return f"No encontre un campo relacionado con '{hint}'."
-
-    std_match = re.search(r"(desviaci[oó]n\s+est[aá]ndar|std|desv)\s+(del?\s+campo\s+)?([a-z_\s]+)", q)
-    if std_match:
-        hint = std_match.group(3).strip().replace(" ", "_")
-        col  = _find_col(df, hint)
-        if col and pd.api.types.is_numeric_dtype(df[col]):
-            return f"La **desviacion estandar** del campo `{col}` es **{df[col].std():,.4f}**."
-        return f"No encontre el campo numerico '{hint}'."
-
-    uniq_match = re.search(r"(valores?\s+[uú]nicos?|cu[aá]ntos?\s+[uú]nicos?|unique)\s+(del?\s+campo\s+)?([a-z_\s]+)", q)
-    if uniq_match:
-        hint    = uniq_match.group(3).strip().replace(" ", "_")
-        col     = _find_col(df, hint)
-        if col:
-            n      = df[col].nunique()
-            sample = ", ".join(str(v) for v in df[col].dropna().unique()[:10])
-            return f"El campo `{col}` tiene **{n} valores unicos**. Ejemplos: {sample}{'...' if n > 10 else ''}."
-        return f"No encontre un campo relacionado con '{hint}'."
-
-    null_match = re.search(r"(nulos?|missing|vacios?|faltantes?)\s+(del?\s+campo\s+)?([a-z_\s]+)", q)
-    if null_match:
-        hint = null_match.group(3).strip().replace(" ", "_")
-        col  = _find_col(df, hint)
-        if col:
-            n   = df[col].isnull().sum()
-            pct = df[col].isnull().mean() * 100
-            return f"El campo `{col}` tiene **{n:,} valores nulos** ({pct:.2f}%)."
-        return f"No encontre el campo '{hint}'."
-
     if re.search(r"tipos?\s+de\s+datos?|datatypes?|tipo\s+de\s+campo", q):
-        lines = [f"- `{c}`: {str(t)}" for c, t in df.dtypes.items()]
-        return "**Tipos de datos:**\n\n" + "\n".join(lines)
+        return "**Tipos de datos:**\n\n" + "\n".join(f"- `{c}`: {t}" for c, t in df.dtypes.items())
 
     if re.search(r"describe|resumen\s+estad[ií]stico|summary|estad[ií]sticas?\s+generales?", q):
         return f"**Resumen estadistico:**\n```\n{df.describe().to_string()}\n```"
 
-    if re.search(r"total\s+de\s+nulos?|cu[aá]ntos?\s+nulos?\s+totales?", q):
+    if re.search(r"total\s+de\s+nulos?|cu[aá]ntos?\s+nulos?\s+(hay\s+)?(en\s+)?total|nulos?\s+totales?", q):
         total  = df.isnull().sum().sum()
         by_col = df.isnull().sum()
         by_col = by_col[by_col > 0]
         if by_col.empty:
             return "El dataset **no tiene valores nulos**."
-        detail = "\n".join(f"- `{c}`: {v}" for c, v in by_col.items())
-        return f"El dataset tiene **{total:,} valores nulos** en total:\n\n{detail}"
+        detalle = "\n".join(f"- `{c}`: {v}" for c, v in by_col.items())
+        return f"El dataset tiene **{total:,} valores nulos** en total:\n\n{detalle}"
 
+    # ── Consultas sobre un campo especifico ────────────────────────────────────
+    # Para todas estas se necesita identificar de que columna habla la pregunta.
+    col = _col_en_pregunta(df, q)
+
+    # Nulos de un campo (se revisa antes que las metricas numericas).
+    if re.search(r"nulos?|missing|vac[ií]os?|faltantes?", q):
+        if col:
+            n, pct = df[col].isnull().sum(), df[col].isnull().mean() * 100
+            return f"El campo `{col}` tiene **{n:,} valores nulos** ({pct:.2f}%)."
+        return "No reconoci el campo. Escribe el nombre exacto de una columna."
+
+    # Valores unicos de un campo.
+    if re.search(r"[uú]nicos?|unique|distintos?", q):
+        if col:
+            n = df[col].nunique()
+            ejemplos = ", ".join(str(v) for v in df[col].dropna().unique()[:10])
+            return f"El campo `{col}` tiene **{n} valores unicos**. Ejemplos: {ejemplos}{'...' if n > 10 else ''}."
+        return "No reconoci el campo. Escribe el nombre exacto de una columna."
+
+    # Valor mas frecuente (moda) de un campo.
+    if re.search(r"m[aá]s\s+frecuente|m[aá]s\s+com[uú]n|moda|most\s+common", q):
+        if col:
+            moda = df[col].mode()
+            if len(moda):
+                veces = (df[col] == moda[0]).sum()
+                return f"El valor mas frecuente del campo `{col}` es **{moda[0]}** (aparece {veces:,} veces)."
+        return "No reconoci el campo. Escribe el nombre exacto de una columna."
+
+    # Metricas numericas: cada intencion se mapea a una operacion de pandas.
+    operaciones = [
+        (r"media|promedio|mean|average",       "media",                lambda s: s.mean()),
+        (r"mediana|median",                    "mediana",              lambda s: s.median()),
+        (r"m[aá]ximo|mayor\s+valor|max",       "valor maximo",         lambda s: s.max()),
+        (r"m[ií]nimo|menor\s+valor|min",       "valor minimo",         lambda s: s.min()),
+        (r"desviaci[oó]n\s+est[aá]ndar|std|desv", "desviacion estandar", lambda s: s.std()),
+        (r"suma|total\s+del\s+campo|sum",      "suma",                 lambda s: s.sum()),
+    ]
+    for patron, nombre, func in operaciones:
+        if re.search(patron, q):
+            if not col:
+                return "No reconoci el campo. Escribe el nombre exacto de una columna."
+            if pd.api.types.is_numeric_dtype(df[col]):
+                # Se capitaliza el nombre de la operacion para una redaccion neutral.
+                return f"**{nombre.capitalize()}** del campo `{col}`: **{_fmt(func(df[col]))}**."
+            # Para maximo/minimo de texto tiene sentido el orden alfabetico.
+            if nombre in ("valor maximo", "valor minimo"):
+                val = df[col].dropna().astype(str).max() if nombre == "valor maximo" \
+                      else df[col].dropna().astype(str).min()
+                return f"**{nombre.capitalize()}** (alfabetico) del campo `{col}`: **'{val}'**."
+            return f"El campo `{col}` no es numerico, no se puede calcular la {nombre}."
+
+    # ── No se entendio la pregunta ─────────────────────────────────────────────
     return (
-        "No entendi la pregunta. Puedes preguntarme:\n\n"
-        "- *Cuantas filas tiene el dataset?*\n"
-        "- *Cuantas columnas tiene?*\n"
+        "No entendi la pregunta. Escribe *ayuda* para ver ejemplos, o prueba con:\n\n"
+        "- *Cuantas columnas tiene el dataset?*\n"
         "- *Cual es la media del campo [nombre]?*\n"
-        "- *Cual es el maximo del campo [nombre]?*\n"
-        "- *Cuantos valores unicos tiene el campo [nombre]?*\n"
-        "- *Cuantos nulos tiene el campo [nombre]?*\n"
-        "- *Cuales son los tipos de datos?*\n"
-        "- *Muéstrame el resumen estadistico*"
+        "- *Cual es el maximo del campo [nombre]?*"
     )
 
 
-def _find_col(df, hint):
-    hint_clean = hint.strip().lower().replace(" ", "_")
-    lower_map  = {c.lower(): c for c in df.columns}
-    if hint_clean in lower_map:
-        return lower_map[hint_clean]
-    for col_lower, col_orig in lower_map.items():
-        if hint_clean in col_lower or col_lower in hint_clean:
-            return col_orig
-    words = [w for w in re.split(r"[\s_]+", hint_clean) if len(w) > 2]
-    for col_lower, col_orig in lower_map.items():
-        if any(w in col_lower for w in words):
-            return col_orig
-    return None
-
-
-SUGGESTIONS = [
-    "Cuantas filas tiene el dataset?",
-    "Cuantas columnas tiene?",
-    "Cuales son los nombres de las columnas?",
-    "Cual es la media del campo rating?",
-    "Cual es el maximo del campo year?",
-    "Cuantos valores unicos tiene el campo genre?",
-    "Cuantos nulos tiene el campo gross?",
-    "Cuales son los tipos de datos?",
-    "Muestrame el resumen estadistico",
-]
-
-
+# ──────────────────────────────────────────────────────────────────────────────
+# INTERFAZ (CHAT)
+# ──────────────────────────────────────────────────────────────────────────────
 def run():
+    """Punto de entrada: elige la fuente de datos y muestra el chat de consultas."""
     st.markdown(LIGHT_CSS, unsafe_allow_html=True)
     st.markdown('<div class="section-title">Prompts de IA</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-label">Realiza preguntas en lenguaje natural sobre los datasets</div>',
+    st.markdown('<div class="sub-label">Haz preguntas en lenguaje natural sobre un dataset o sobre tu propio archivo</div>',
                 unsafe_allow_html=True)
 
-    ds_name = st.sidebar.selectbox("Dataset", list(DATASETS.keys()))
-    df = DATASETS[ds_name]()
+    # ── Fuente de datos: un dataset del proyecto o un archivo propio ────────────
+    # Se coloca arriba, en el area principal, para que sea facil de encontrar.
+    fuente = st.radio("Fuente de datos",
+                      list(DATASETS.keys()) + ["Subir mi archivo (CSV/Excel)"],
+                      horizontal=True)
 
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
+    if fuente == "Subir mi archivo (CSV/Excel)":
+        archivo = st.file_uploader("Cargue su archivo CSV o Excel", type=["csv", "xlsx", "xls"])
+        if archivo is None:
+            st.info("Seleccione un archivo CSV o Excel para empezar a preguntar sobre el.")
+            return
+        try:
+            df = (pd.read_csv(archivo) if archivo.name.lower().endswith("csv")
+                  else pd.read_excel(archivo))
+        except Exception as e:
+            st.error(f"No se pudo leer el archivo: {e}")
+            return
+        fuente_id = archivo.name
+    else:
+        df = DATASETS[fuente]()
+        fuente_id = fuente
 
+    # Resumen de la fuente activa y lista de columnas disponibles.
+    st.caption(f"Fuente activa: **{fuente_id}** — {len(df):,} filas, {df.shape[1]} columnas.")
+    with st.expander("Ver columnas disponibles para preguntar"):
+        st.write(", ".join(f"`{c}`" for c in df.columns))
+
+    # El historial se reinicia si se cambia de fuente de datos (las respuestas
+    # anteriores ya no aplicarian al nuevo dataset).
+    if st.session_state.get("prompts_fuente") != fuente_id:
+        st.session_state.prompts_fuente = fuente_id
+        st.session_state.prompts_chat = []
+
+    # Botones con preguntas sugeridas.
     st.markdown("**Preguntas sugeridas:**")
     cols = st.columns(3)
     for i, sug in enumerate(SUGGESTIONS):
         with cols[i % 3]:
             if st.button(sug, key=f"sug_{i}", use_container_width=True):
-                st.session_state.chat_history.append({"role": "user", "content": sug})
-                st.session_state.chat_history.append({"role": "ai", "content": _answer(sug, df)})
+                st.session_state.prompts_chat.append(("user", sug))
+                st.session_state.prompts_chat.append(("assistant", _answer(sug, df)))
+                st.rerun()
 
     st.markdown("---")
 
-    for msg in st.session_state.chat_history:
-        if msg["role"] == "user":
-            st.markdown('<div class="chat-label-user">Tu</div>', unsafe_allow_html=True)
-            st.markdown(f'<div class="chat-bubble-user">{msg["content"]}</div>', unsafe_allow_html=True)
-        else:
-            st.markdown('<div class="chat-label-ai">Asistente de Datos</div>', unsafe_allow_html=True)
-            st.markdown(f'<div class="chat-bubble-ai">', unsafe_allow_html=True)
-            st.markdown(msg["content"])
-            st.markdown('</div>', unsafe_allow_html=True)
+    # Mensaje de bienvenida cuando aun no hay conversacion.
+    if not st.session_state.prompts_chat:
+        with st.chat_message("assistant"):
+            st.markdown("Hola. Preguntame lo que quieras sobre los datos. "
+                        "Escribe *ayuda* si no sabes por donde empezar.")
 
-    with st.form("chat_form", clear_on_submit=True):
-        user_input = st.text_input(
-            "Escribe tu pregunta sobre el dataset...",
-            placeholder="Ej: Cual es la media del campo rating?",
-            label_visibility="collapsed",
-        )
-        submitted = st.form_submit_button("Enviar", type="primary")
+    # Historial de la conversacion, con burbujas de chat.
+    for rol, contenido in st.session_state.prompts_chat:
+        with st.chat_message(rol):
+            st.markdown(contenido)
 
-    if submitted and user_input.strip():
-        st.session_state.chat_history.append({"role": "user",  "content": user_input})
-        st.session_state.chat_history.append({"role": "ai",    "content": _answer(user_input, df)})
+    # Caja de entrada del chat (aparece fija en la parte inferior).
+    pregunta = st.chat_input("Escribe tu pregunta sobre el dataset...")
+    if pregunta:
+        st.session_state.prompts_chat.append(("user", pregunta))
+        st.session_state.prompts_chat.append(("assistant", _answer(pregunta, df)))
         st.rerun()
 
-    if st.button("Limpiar conversacion"):
-        st.session_state.chat_history = []
+    # Boton para reiniciar la conversacion.
+    if st.session_state.prompts_chat and st.button("Limpiar conversacion"):
+        st.session_state.prompts_chat = []
         st.rerun()
