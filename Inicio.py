@@ -214,9 +214,9 @@ if page == "Inicio":
     with col_a:
         st.markdown("""
         <div class="home-card">
-            <h4>IMDB Top Movies 1980-2026</h4>
-            <p>Coleccion de las mejores peliculas de IMDB en el periodo 1980-2026.
-            Incluye titulo, anio, calificacion, generos, votos, recaudacion y mas.</p>
+            <h4>Video Games Sales & Ratings</h4>
+            <p>Catalogo de videojuegos con plataforma, genero, anio, publisher,
+            puntuaciones de Metacritic y usuarios, ventas por region y recaudacion estimada.</p>
         </div>
         """, unsafe_allow_html=True)
     with col_b:
